@@ -18,13 +18,13 @@
 #define TFT_WIDTH   320
 #define TFT_HEIGHT  240
 
-// BAR_WIDTH derives from the segment count (defined in ili_driver.h), so the two
-// always stay in sync — change VU_DB_FLOOR/VU_DB_CEILING there, not here.
-#define BAR_WIDTH   (VU_NUM_SEGMENTS * 5)
-#define BAR_HEIGHT  8
-#define BAR_BYTES   (BAR_WIDTH * BAR_HEIGHT * 2)
+#define LEGACY_BAR_WIDTH  (VU_NUM_SEGMENTS * 5)
+#define NEW_BAR_WIDTH     ((VU_DB_CEILING - VU_NEW_DB_FLOOR + 1) * 7)
+#define MAX_BAR_WIDTH     NEW_BAR_WIDTH
+#define LEGACY_BAR_HEIGHT 8
+#define NEW_BAR_HEIGHT    16
 #define METRICS_HEIGHT 8
-#define METRICS_BYTES (BAR_WIDTH * METRICS_HEIGHT * 2)
+#define BAR_BUFFER_BYTES (MAX_BAR_WIDTH * NEW_BAR_HEIGHT * 2)
 
 #define COLOR_BLACK       0x0000
 #define COLOR_RED         0xF800
@@ -44,7 +44,18 @@
 // spi dma
 volatile bool bar_dma_busy = false;
 
-static uint8_t barTransferBuffer[METRICS_BYTES];
+static uint8_t barTransferBuffer[BAR_BUFFER_BYTES];
+static bool new_display_mode = false;
+
+static int bar_width()
+{
+    return new_display_mode ? NEW_BAR_WIDTH : LEGACY_BAR_WIDTH;
+}
+
+static int bar_floor()
+{
+    return new_display_mode ? VU_NEW_DB_FLOOR : VU_DB_FLOOR;
+}
 
 // VU fill: green below -12, yellow -12..-1, red at 0 and above.
 static uint16_t vu_level_color(int level)
@@ -54,11 +65,10 @@ static uint16_t vu_level_color(int level)
     return COLOR_RED;
 }
 
-// Peak marker: green below -12, yellow -12..11, red at 12 and above.
+// Peak marker: blue through +8, red above +8.
 static uint16_t peak_level_color(int level)
 {
-    if (level <= -12) return COLOR_BLUE;
-    if (level < 12) return COLOR_BLUE;
+    if (level <= 8) return COLOR_BLUE;
     return COLOR_RED;
 }
 
@@ -128,6 +138,11 @@ void ili_init()
     digitalWrite(TFT_CS, HIGH);
 }
 
+void ili_set_display_mode(bool new_display)
+{
+    new_display_mode = new_display;
+}
+
 void ili_fill(uint16_t color)
 {
     setAddrWindow(0, 0, TFT_WIDTH, TFT_HEIGHT);
@@ -180,35 +195,42 @@ void draw_vertical_line(int x, int start_y, int end_y, uint16_t color)
 
 void create_bar(int vu, int peak)
 {
-    if (vu < VU_DB_FLOOR) vu = VU_DB_FLOOR;
+    const int floor = bar_floor();
+    const int width = bar_width();
+    const int num_segments = VU_DB_CEILING - floor + 1;
+    const bool vu_below_floor = vu < floor;
+
+    if (vu < floor) vu = floor;
     if (vu > VU_DB_CEILING) vu = VU_DB_CEILING;
-    if (peak < VU_DB_FLOOR) peak = VU_DB_FLOOR;
+    if (peak < floor) peak = floor;
     if (peak > VU_DB_CEILING) peak = VU_DB_CEILING;
 
-    // At the floor, nothing is lit at all (matches every other inactive segment).
-    bool vu_is_floor = (vu <= VU_DB_FLOOR);
+    bool vu_is_floor = new_display_mode ? vu_below_floor : vu <= floor;
 
     uint16_t segmentColors[VU_NUM_SEGMENTS];
-    for (int segment = 0; segment < VU_NUM_SEGMENTS; segment++) {
-        int level = segment + VU_DB_FLOOR;
-        segmentColors[segment] = (!vu_is_floor && segment <= (vu - VU_DB_FLOOR))
+    for (int segment = 0; segment < num_segments; segment++) {
+        int level = segment + floor;
+        segmentColors[segment] = (!vu_is_floor && segment <= (vu - floor))
             ? VU_COLOR(vu_level_color(level))
             : DARK_COLOR(vu_level_color(level));
     }
 
-    int peakSegment = peak - VU_DB_FLOOR;
-    if (peakSegment >= VU_NUM_SEGMENTS) peakSegment = VU_NUM_SEGMENTS - 1;
+    int peakSegment = peak - floor;
+    if (peakSegment >= num_segments) peakSegment = num_segments - 1;
     // Don't draw the peak marker on top of the VU bar's own leading edge.
     if (peak != vu) {
         segmentColors[peakSegment] = peak_level_color(peak);
     }
 
     uint32_t byteIndex = 0;
-    for (int row = 0; row < BAR_HEIGHT; row++) {
-        for (int wireColumn = 0; wireColumn < BAR_WIDTH; wireColumn++) {
-            int logicalColumn = BAR_WIDTH - 1 - wireColumn;
-            int segment = logicalColumn / 5;
-            uint16_t pixel = (logicalColumn % 5 < 4)
+    const int height = new_display_mode ? NEW_BAR_HEIGHT : LEGACY_BAR_HEIGHT;
+    for (int row = 0; row < height; row++) {
+        for (int wireColumn = 0; wireColumn < width; wireColumn++) {
+            int logicalColumn = width - 1 - wireColumn;
+            int segment_width = new_display_mode ? 7 : 5;
+            int lit_width = new_display_mode ? 6 : 4;
+            int segment = logicalColumn / segment_width;
+            uint16_t pixel = (logicalColumn % segment_width < lit_width)
                 ? segmentColors[segment]
                 : COLOR_BLACK;
             barTransferBuffer[byteIndex++] = pixel >> 8;
@@ -238,7 +260,9 @@ static void send_buffer_dma(int x, int y, int width, int height)
 
 void send_bar(int x, int y)
 {
-    send_buffer_dma(x, y, BAR_WIDTH, BAR_HEIGHT);
+    const int width = bar_width();
+    const int height = new_display_mode ? NEW_BAR_HEIGHT : LEGACY_BAR_HEIGHT;
+    send_buffer_dma(x, y, width, height);
 }
 
 static int draw_buffer_text(int x, int y, const char *text, uint16_t color)
@@ -250,10 +274,11 @@ static int draw_buffer_text(int x, int y, const char *text, uint16_t color)
         const uint8_t *glyph = font5x7[character - 32];
         for (int row = 0; row < 7; row++) {
             for (int column = 0; column < 5; column++) {
-                if (glyph[column] & (1 << (6 - row))) {
+                if ((glyph[column] & (1 << (6 - row))) &&
+                    x + column < bar_width()) {
                     int logicalColumn = x + column;
-                    int wireColumn = BAR_WIDTH - 1 - logicalColumn;
-                    uint32_t byteIndex = (y + row) * BAR_WIDTH * 2 + wireColumn * 2;
+                    int wireColumn = bar_width() - 1 - logicalColumn;
+                    uint32_t byteIndex = (y + row) * bar_width() * 2 + wireColumn * 2;
                     barTransferBuffer[byteIndex] = color >> 8;
                     barTransferBuffer[byteIndex + 1] = color & 0xFF;
                 }
@@ -294,7 +319,7 @@ void draw_audio_metrics(int x, int y,
                         uint32_t raw_rms_ch1, int vu_db_ch1, int pk_db_ch1,
                         uint32_t frame_work_percent)
 {
-    for (uint32_t byteIndex = 0; byteIndex < METRICS_BYTES; byteIndex++) {
+    for (uint32_t byteIndex = 0; byteIndex < BAR_BUFFER_BYTES; byteIndex++) {
         barTransferBuffer[byteIndex] = 0;
     }
 
@@ -304,7 +329,7 @@ void draw_audio_metrics(int x, int y,
     cursor = draw_buffer_unsigned(cursor + 6, 0, frame_work_percent, COLOR_WHITE);
     draw_buffer_text(cursor, 0, "%", COLOR_WHITE);
 
-    send_buffer_dma(x, y, BAR_WIDTH, METRICS_HEIGHT);
+    send_buffer_dma(x, y, bar_width(), METRICS_HEIGHT);
 }
 
 void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi)

@@ -1,3 +1,6 @@
+// Startup display selection: PB5/PB4 use INPUT_PULLUP and are sampled once.
+// 11 selects the existing -40..+14 display; 10 selects the new -30..+14 display.
+// 01 and 00 are reserved and leave the display blank.
 #include "Arduino.h"
 #include "ili_driver.h"
 #include <SPI.h>
@@ -21,6 +24,11 @@
 #define AUDIO_IN_L_PIN PA0    // Mapped directly to ADC1 Master
 #define AUDIO_IN_R_PIN PA1    // Mapped directly to ADC2 Slave
 #define LCD_BACKLIGHT_PIN PA8 // Drives the LCD backlight: HIGH on, LOW off
+// Startup display selection: PB5/PB4 use INPUT_PULLUP and are sampled once.
+// 11 selects the existing -40..+14 display; 10 selects the new -30..+14 display.
+// 01 and 00 are reserved and leave the display blank.
+#define DISPLAY_SELECT_PB5 PB5
+#define DISPLAY_SELECT_PB4 PB4
 
 // Peak decay is applied at the 40ms display rate, scaled to the 54dB display
 // range: 1.7s * (54/20) = 4.59s full-scale fall.
@@ -49,6 +57,9 @@ const uint32_t CONFIG_PK_HOLD_FRAMES = (uint32_t)(PEAK_HOLD_SECONDS * 25.0f);
 // ==========================================================
 #define L_R_HEIGHT 30
 #define S_D_HEIGHT 120
+#define NEW_L_BAR_Y 80
+#define NEW_R_BAR_Y 103
+#define NEW_METRICS_Y 195
 
 #define BLOCK_TOP_LABEL_OFF 0
 #define BLOCK_TOP_LINE_OFF 14
@@ -118,6 +129,9 @@ TIM_HandleTypeDef htim3;
 #define COLOR_YELLOW 0xFFE0
 #define COLOR_BLUE 0x001F
 
+static bool display_mode_selected = false;
+static bool new_display_mode = false;
+
 extern "C" void DMA1_Channel1_IRQHandler(void)
 {
   HAL_DMA_IRQHandler(&hdma_adc1);
@@ -131,18 +145,72 @@ static void draw_scale(int label_y, int line_y, int tick_start_y)
   static const uint16_t colors[] = {
       COLOR_YELLOW, COLOR_YELLOW, COLOR_YELLOW, COLOR_YELLOW,
       COLOR_YELLOW, COLOR_YELLOW, COLOR_RED, COLOR_YELLOW,
-      COLOR_YELLOW, COLOR_YELLOW};
+      COLOR_YELLOW, COLOR_RED};
 
   draw_horizontal_line(25, 219, line_y, COLOR_YELLOW);
   draw_horizontal_line(220, 234, line_y, COLOR_RED);
-  draw_horizontal_line(235, 284, line_y, COLOR_YELLOW);
-  draw_horizontal_line(285, 299, line_y, COLOR_RED);
+  draw_horizontal_line(235, 269, line_y, COLOR_YELLOW);
+  draw_horizontal_line(270, 299, line_y, COLOR_RED);
 
   for (int index = 0; index < 10; index++)
   {
     ili_drawString(label_x[index], label_y, labels[index], colors[index]);
     draw_vertical_line(tick_x[index], tick_start_y, tick_start_y + 2, colors[index]);
   }
+}
+
+static void draw_new_scale(int top_label_y, int line_y, int tick_start_y,
+                           bool ticks_above_line)
+{
+  draw_horizontal_line(1, 210, line_y, COLOR_YELLOW);
+  draw_horizontal_line(211, 224, line_y, COLOR_RED);
+  draw_horizontal_line(225, 273, line_y, COLOR_YELLOW);
+  draw_horizontal_line(274, 315, line_y, COLOR_RED);
+
+  for (int value = VU_NEW_DB_FLOOR; value <= VU_DB_CEILING; value++)
+  {
+    const int segment = value - VU_NEW_DB_FLOOR;
+    const int label_x = segment * 7 + 5;
+    const int tick_x = segment * 7 + 7;
+    const uint16_t color = value == 0 || value >= 9 ? COLOR_RED : COLOR_YELLOW;
+    const int magnitude = value < 0 ? -value : value;
+    const bool lower_label_row = ticks_above_line
+        ? value % 2 == 0
+        : value % 2 != 0;
+    const int label_y = top_label_y + (lower_label_row ? 27 : 0) +
+                        (ticks_above_line ? (value % 2 == 0 ? 6 : 8)
+                                          : (value % 2 == 0 ? 2 : 0));
+    if (magnitude >= 10)
+    {
+      const char tens[] = {static_cast<char>('0' + magnitude / 10), '\0'};
+      ili_drawString(label_x, label_y, tens, color);
+    }
+
+    const char ones[] = {static_cast<char>('0' + magnitude % 10), '\0'};
+    ili_drawString(label_x, label_y + 10, ones, color);
+
+    if (ticks_above_line)
+    {
+      draw_vertical_line(tick_x, tick_start_y - (value % 2 != 0 ? 25 : 0),
+                         tick_start_y + 2, color);
+    }
+    else
+    {
+      draw_vertical_line(tick_x, tick_start_y,
+                         tick_start_y + (value % 2 != 0 ? 27 : 2), color);
+    }
+  }
+}
+
+static void draw_new_layout()
+{
+  draw_new_scale(16, 74, 71, true);
+  draw_new_scale(132, 125, 126, false);
+  ili_drawString(0, 34, "L", COLOR_YELLOW);
+  ili_drawString(0, 159, "R", COLOR_YELLOW);
+  ili_drawString(136, 182, "VU RANGE", COLOR_YELLOW);
+  ili_drawString(215, 182, "|", COLOR_RED);
+  ili_drawString(250, 182, "PPM", COLOR_BLUE);
 }
 
 static void draw_block(int top_y, const char *row1_label, const char *row2_label)
@@ -162,6 +230,14 @@ void setup()
 {
   Serial.begin(115200);
 
+  pinMode(DISPLAY_SELECT_PB5, INPUT_PULLUP);
+  pinMode(DISPLAY_SELECT_PB4, INPUT_PULLUP);
+  const bool pb5_high = digitalRead(DISPLAY_SELECT_PB5) == HIGH;
+  const bool pb4_high = digitalRead(DISPLAY_SELECT_PB4) == HIGH;
+  display_mode_selected = pb5_high;
+  new_display_mode = pb5_high && !pb4_high;
+  ili_set_display_mode(new_display_mode);
+
   pinMode(LCD_BACKLIGHT_PIN, OUTPUT);
   digitalWrite(LCD_BACKLIGHT_PIN, HIGH);
 
@@ -169,8 +245,18 @@ void setup()
   setup_spi_dma();
 
   ili_fill(0x0000);
-  draw_block(L_R_HEIGHT, "L", "R");
-  draw_block(S_D_HEIGHT, "S", "D");
+  if (display_mode_selected)
+  {
+    if (new_display_mode)
+    {
+      draw_new_layout();
+    }
+    else
+    {
+      draw_block(L_R_HEIGHT, "L", "R");
+      draw_block(S_D_HEIGHT, "S", "D");
+    }
+  }
 
   // 1. Clock Power Declarations
   __HAL_RCC_ADC1_CLK_ENABLE();
@@ -685,8 +771,18 @@ void loop()
       {
         // This is the first serial message after an off period.
         Serial.println("Display on");
-        draw_block(L_R_HEIGHT, "L", "R");
-        draw_block(S_D_HEIGHT, "S", "D");
+        if (display_mode_selected)
+        {
+          if (new_display_mode)
+          {
+            draw_new_layout();
+          }
+          else
+          {
+            draw_block(L_R_HEIGHT, "L", "R");
+            draw_block(S_D_HEIGHT, "S", "D");
+          }
+        }
         digitalWrite(LCD_BACKLIGHT_PIN, HIGH);
         display_is_on = true;
         consecutive_silent_seconds = 0;
@@ -699,39 +795,45 @@ void loop()
 
     bool should_update_display = !(is_silent_now && last_frame_was_silent);
 
-    if (display_is_on && should_update_display)
+    if (display_mode_selected && display_is_on && should_update_display)
     {
       create_bar(final_vu_db_ch0, pk_db_ch0);
-      send_bar(20, L_R_HEIGHT + BLOCK_ROW1_OFF);
+      send_bar(new_display_mode ? 0 : 20,
+               new_display_mode ? NEW_L_BAR_Y : L_R_HEIGHT + BLOCK_ROW1_OFF);
       create_bar(final_vu_db_ch1, pk_db_ch1);
-      send_bar(20, L_R_HEIGHT + BLOCK_ROW2_OFF);
-      create_bar(final_vu_db_sum, pk_db_sum);
-      send_bar(20, S_D_HEIGHT + BLOCK_ROW1_OFF);
-      create_bar(final_vu_db_diff, pk_db_diff);
-      send_bar(20, S_D_HEIGHT + BLOCK_ROW2_OFF);
+      send_bar(new_display_mode ? 0 : 20,
+               new_display_mode ? NEW_R_BAR_Y : L_R_HEIGHT + BLOCK_ROW2_OFF);
+      if (!new_display_mode)
+      {
+        create_bar(final_vu_db_sum, pk_db_sum);
+        send_bar(20, S_D_HEIGHT + BLOCK_ROW1_OFF);
+        create_bar(final_vu_db_diff, pk_db_diff);
+        send_bar(20, S_D_HEIGHT + BLOCK_ROW2_OFF);
+      }
     }
 
     last_frame_was_silent = is_silent_now;
 
-        // if (!(is_silent_now && last_frame_was_silent)) {
-        //     Serial.print(raw_rms_ch0);
-        //     Serial.print(',');
-        //     Serial.print(final_vu_db_ch0);
-        //     Serial.print(',');
-        //     Serial.print(pk_db_ch0);
-        //     Serial.print('\t');
-        //     Serial.print(raw_rms_ch1);
-        //     Serial.print(',');
-        //     Serial.print(final_vu_db_ch1);
-        //     Serial.print(',');
-        //     Serial.print(pk_db_ch1);
-        //     Serial.print('\t');
-        //     Serial.println(frame_work_percent);
-        // }
+        if (!(is_silent_now && last_frame_was_silent)) {
+            Serial.print(raw_rms_ch0);
+            Serial.print(',');
+            Serial.print(final_vu_db_ch0);
+            Serial.print(',');
+            Serial.print(pk_db_ch0);
+            Serial.print('\t');
+            Serial.print(raw_rms_ch1);
+            Serial.print(',');
+            Serial.print(final_vu_db_ch1);
+            Serial.print(',');
+            Serial.print(pk_db_ch1);
+            Serial.print('\t');
+            Serial.println(frame_work_percent);
+        }
 
-    if (display_is_on && should_update_display)
+    if (display_mode_selected && display_is_on && should_update_display)
     {
-      draw_audio_metrics(20, 205,
+      draw_audio_metrics(new_display_mode ? 0 : 20,
+                         new_display_mode ? NEW_METRICS_Y : 205,
                          raw_rms_ch0, final_vu_db_ch0, pk_db_ch0,
                          raw_rms_ch1, final_vu_db_ch1, pk_db_ch1,
                          frame_work_percent);

@@ -7,9 +7,11 @@
 #define VU_DB_FLOOR      (-40)
 #define VU_DB_CEILING    14
 #define VU_NUM_SEGMENTS  (VU_DB_CEILING - VU_DB_FLOOR + 1)   // 55
+#define VU_NEW_DB_FLOOR  (-30)
 
 void ili_init();
 void setup_spi_dma();
+void ili_set_display_mode(bool new_display);
 void ili_fill(uint16_t color);
 void ili_drawString(int x, int y, const char* s, uint16_t color);
 
