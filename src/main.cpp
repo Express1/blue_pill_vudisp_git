@@ -1,16 +1,19 @@
 // Startup display selection: PB5/PB4 use INPUT_PULLUP and are sampled once.
-// 11 selects the existing -40..+14 display; 10 selects the new -30..+14 display.
-// 01 and 00 are reserved and leave the display blank.
+// 11 selects the -40..+14 dB display with sum and differnce also
+// 10 selects the -30..+14 dB display.
+// 01 selects the -30..+14 display with a simplified linear-value scale in Watts
+// 00 Debug plus the -40..+14 dB display with sum and differnce also
 #include "Arduino.h"
 #include "ili_driver.h"
 #include <SPI.h>
+#include <string.h>
 
 #define SAMPLES_PER_BLOCK 120
 #define TOTAL_BUF_LEN (SAMPLES_PER_BLOCK * 2)
 #define BLOCKS_PER_DISPLAY 64
 #define TOTAL_SAMPLES (SAMPLES_PER_BLOCK * BLOCKS_PER_DISPLAY) // 7,680 samples
 // turn off display if the audio is silent for this many seconds
-#define DISPLAY_OFF_SILENCE_SECONDS 10
+#define DISPLAY_OFF_SILENCE_SECONDS 300
 #define AUDIO_FRAMES_PER_SECOND 25
 #define AUDIO_FRAMES_REQUIRED 20
 
@@ -25,8 +28,6 @@
 #define AUDIO_IN_R_PIN PA1    // Mapped directly to ADC2 Slave
 #define LCD_BACKLIGHT_PIN PA8 // Drives the LCD backlight: HIGH on, LOW off
 // Startup display selection: PB5/PB4 use INPUT_PULLUP and are sampled once.
-// 11 selects the existing -40..+14 display; 10 selects the new -30..+14 display.
-// 01 and 00 are reserved and leave the display blank.
 #define DISPLAY_SELECT_PB5 PB5
 #define DISPLAY_SELECT_PB4 PB4
 
@@ -37,7 +38,8 @@
 
 #define PK_DECAY_FRAC_BITS 8
 const int32_t CONFIG_PK_DECAY_STEP_FRAC =
-    (int32_t)(((int64_t)54 * 1000 * (1 << PK_DECAY_FRAC_BITS)) / ((int64_t)PEAK_FALL_MS * 25));
+    (int32_t)(((int64_t)54 * 1000 * (1 << PK_DECAY_FRAC_BITS)) /
+              ((int64_t)PEAK_FALL_MS * AUDIO_FRAMES_PER_SECOND));
 
 int32_t pk_decay_accum_ch0 = 0;
 int32_t pk_decay_accum_ch1 = 0;
@@ -45,7 +47,8 @@ int32_t pk_decay_accum_sum = 0;
 int32_t pk_decay_accum_diff = 0;
 
 // Automated Core Multipliers Derived From Target Time Configurations
-const uint32_t CONFIG_PK_HOLD_FRAMES = (uint32_t)(PEAK_HOLD_SECONDS * 25.0f);
+const uint32_t CONFIG_PK_HOLD_FRAMES =
+    (uint32_t)(PEAK_HOLD_SECONDS * AUDIO_FRAMES_PER_SECOND);
 
 // Two-stage rectified-average detector: reaches 99% in 300ms at 625us per block.
 #define VU_RECTIFIED_ALPHA_Q16 899
@@ -85,8 +88,6 @@ struct FrameMetrics
 {
   uint64_t sum_squares_ch0;
   uint64_t sum_squares_ch1;
-  uint64_t sum_squares_sum;
-  uint64_t sum_squares_diff;
   uint32_t max_peak_ch0;
   uint32_t max_peak_ch1;
   uint32_t max_peak_sum;
@@ -124,13 +125,13 @@ ADC_HandleTypeDef hadc2;
 DMA_HandleTypeDef hdma_adc1;
 TIM_HandleTypeDef htim3;
 
-#define COLOR_ORANGE 0xFD20
 #define COLOR_RED 0xF800
 #define COLOR_YELLOW 0xFFE0
 #define COLOR_BLUE 0x001F
 
-static bool display_mode_selected = false;
 static bool new_display_mode = false;
+static bool simple_scale_mode = false;
+static bool debug_info_mode = false;
 
 extern "C" void DMA1_Channel1_IRQHandler(void)
 {
@@ -202,15 +203,87 @@ static void draw_new_scale(int top_label_y, int line_y, int tick_start_y,
   }
 }
 
-static void draw_new_layout()
+static void draw_simple_scale(int top_label_y, int line_y, bool ticks_above_line)
 {
-  draw_new_scale(16, 74, 71, true);
-  draw_new_scale(132, 125, 126, false);
-  ili_drawString(0, 34, "L", COLOR_YELLOW);
-  ili_drawString(0, 159, "R", COLOR_YELLOW);
-  ili_drawString(136, 182, "VU RANGE", COLOR_YELLOW);
-  ili_drawString(215, 182, "|", COLOR_RED);
-  ili_drawString(250, 182, "PPM", COLOR_BLUE);
+  struct ScaleLabel
+  {
+    int db;
+    const char *text;
+  };
+  static const ScaleLabel labels[] = {
+      {-30, "0.1"}, {-27, "0.2"}, {-23, "0.5"}, {-20, "1"},
+      {-17, "2"}, {-13, "5"}, {-10, "10"}, {-7, "20"},
+      {-3, "50"}, {0, "100"}, {3, "200"}, {7, "500"}};
+
+  draw_horizontal_line(1, 210, line_y, COLOR_YELLOW);
+  draw_horizontal_line(211, 224, line_y, COLOR_RED);
+  draw_horizontal_line(225, 273, line_y, COLOR_YELLOW);
+  draw_horizontal_line(274, 315, line_y, COLOR_RED);
+
+  for (int value = VU_NEW_DB_FLOOR; value <= VU_DB_CEILING; value++)
+  {
+    const int tick_x = (value - VU_NEW_DB_FLOOR) * 7 + 7;
+    const uint16_t color = value == 0 || value >= 9 ? COLOR_RED : COLOR_YELLOW;
+    const bool long_tick = value == -27 || value == -23 || value == -17 ||
+        value == -13 || value == -7 || value == -3 || value == 3 || value == 7;
+    const bool medium_tick = value == -30 || value == -20 || value == -10 || value == 0;
+    const bool short_tick = value == -25 || value == -24 || value == -15 ||
+        value == -14 || value == -11 || value == -5 || value == -4 ||
+        value == -1 || value == 5 || value == 6;
+    const int tick_length = long_tick ? 13 : (medium_tick ? 6 : (short_tick ? 3 : 0));
+    const char *label = nullptr;
+    for (unsigned int index = 0; index < sizeof(labels) / sizeof(labels[0]); index++)
+    {
+      if (labels[index].db == value)
+      {
+        label = labels[index].text;
+        break;
+      }
+    }
+    if (label != nullptr)
+    {
+      const int label_length = static_cast<int>(strlen(label));
+      const int label_width = label_length * 6 - 1;
+      int label_x = tick_x - label_width / 2;
+      if (label_x < 0)
+        label_x = 0;
+      else if (label_x + label_width > 320)
+        label_x = 320 - label_width;
+      const int label_row = long_tick ? 0 : 1;
+      const int label_y = ticks_above_line
+          ? top_label_y + label_row * 10
+          : top_label_y + 28 - label_row * 10;
+      ili_drawString(label_x, label_y, label, color);
+    }
+
+    if (tick_length > 0)
+    {
+      if (ticks_above_line)
+        draw_vertical_line(tick_x, line_y - tick_length + 1, line_y, color);
+      else
+        draw_vertical_line(tick_x, line_y, line_y + tick_length - 1, color);
+    }
+  }
+}
+
+static void draw_new_layout(bool simple_scale)
+{
+  if (simple_scale)
+  {
+    draw_simple_scale(47, 74, true);
+    draw_simple_scale(118, 125, false);
+  }
+  else
+  {
+    draw_new_scale(16, 74, 71, true);
+    draw_new_scale(132, 125, 126, false);
+  }
+  ili_drawString(0, simple_scale ? 37 : 34, "L", COLOR_YELLOW);
+  ili_drawString(0, simple_scale ? 156 : 159, "R", COLOR_YELLOW);
+  const int header_y = simple_scale ? 158 : 182;
+  ili_drawString(136, header_y, "VU RANGE", COLOR_YELLOW);
+  ili_drawString(215, header_y, "|", COLOR_RED);
+  ili_drawString(250, header_y, "PPM", COLOR_BLUE);
 }
 
 static void draw_block(int top_y, const char *row1_label, const char *row2_label)
@@ -234,8 +307,9 @@ void setup()
   pinMode(DISPLAY_SELECT_PB4, INPUT_PULLUP);
   const bool pb5_high = digitalRead(DISPLAY_SELECT_PB5) == HIGH;
   const bool pb4_high = digitalRead(DISPLAY_SELECT_PB4) == HIGH;
-  display_mode_selected = pb5_high;
-  new_display_mode = pb5_high && !pb4_high;
+  new_display_mode = pb5_high != pb4_high;
+  simple_scale_mode = !pb5_high && pb4_high;
+  debug_info_mode = !pb5_high && !pb4_high;
   ili_set_display_mode(new_display_mode);
 
   pinMode(LCD_BACKLIGHT_PIN, OUTPUT);
@@ -245,17 +319,14 @@ void setup()
   setup_spi_dma();
 
   ili_fill(0x0000);
-  if (display_mode_selected)
+  if (new_display_mode)
   {
-    if (new_display_mode)
-    {
-      draw_new_layout();
-    }
-    else
-    {
-      draw_block(L_R_HEIGHT, "L", "R");
-      draw_block(S_D_HEIGHT, "S", "D");
-    }
+    draw_new_layout(simple_scale_mode);
+  }
+  else
+  {
+    draw_block(L_R_HEIGHT, "L", "R");
+    draw_block(S_D_HEIGHT, "S", "D");
   }
 
   // 1. Clock Power Declarations
@@ -365,7 +436,7 @@ static void process_dma_block(uint32_t source_offset)
   uint32_t block_sum_ch0 = 0;
   uint32_t block_sum_ch1 = 0;
 
-  uint64_t sum_sq_ch0 = 0, sum_sq_ch1 = 0, sum_sq_sum = 0, sum_sq_diff = 0;
+  uint64_t sum_sq_ch0 = 0, sum_sq_ch1 = 0;
   uint32_t sum_abs_ch0 = 0, sum_abs_ch1 = 0, sum_abs_sum = 0, sum_abs_diff = 0;
   uint32_t frame_peak_ch0 = metrics.max_peak_ch0;
   uint32_t frame_peak_ch1 = metrics.max_peak_ch1;
@@ -393,8 +464,6 @@ static void process_dma_block(uint32_t source_offset)
 
     sum_sq_ch0 += (int64_t)ac_ch0 * ac_ch0;
     sum_sq_ch1 += (int64_t)ac_ch1 * ac_ch1;
-    sum_sq_sum += (int64_t)ac_sum * ac_sum;
-    sum_sq_diff += (int64_t)ac_diff * ac_diff;
     sum_abs_ch0 += abs_ch0;
     sum_abs_ch1 += abs_ch1;
     sum_abs_sum += abs_sum;
@@ -429,8 +498,6 @@ static void process_dma_block(uint32_t source_offset)
 
   metrics.sum_squares_ch0 += sum_sq_ch0;
   metrics.sum_squares_ch1 += sum_sq_ch1;
-  metrics.sum_squares_sum += sum_sq_sum;
-  metrics.sum_squares_diff += sum_sq_diff;
 
   uint32_t block_rectified_ch0_q8 = (sum_abs_ch0 << VU_RECTIFIED_FRAC_BITS) / SAMPLES_PER_BLOCK;
   uint32_t block_rectified_ch1_q8 = (sum_abs_ch1 << VU_RECTIFIED_FRAC_BITS) / SAMPLES_PER_BLOCK;
@@ -452,8 +519,6 @@ static void process_dma_block(uint32_t source_offset)
     active_metrics_index ^= 1;
     metric_buffers[active_metrics_index].sum_squares_ch0 = 0;
     metric_buffers[active_metrics_index].sum_squares_ch1 = 0;
-    metric_buffers[active_metrics_index].sum_squares_sum = 0;
-    metric_buffers[active_metrics_index].sum_squares_diff = 0;
     metric_buffers[active_metrics_index].max_peak_ch0 = 0;
     metric_buffers[active_metrics_index].max_peak_ch1 = 0;
     metric_buffers[active_metrics_index].max_peak_sum = 0;
@@ -521,18 +586,11 @@ void loop()
 
   static uint32_t frame_work_total_us = 0;
   static uint32_t frame_work_percent = 0;
-  static uint32_t audio_window_start_ms = 0;
   static uint8_t silent_frames_in_window = 0;
   static uint8_t active_frames_in_window = 0;
   static uint16_t consecutive_silent_seconds = 0;
   static bool display_is_on = true;
-  static bool audio_window_started = false;
-
-  if (!audio_window_started)
-  {
-    audio_window_start_ms = millis();
-    audio_window_started = true;
-  }
+  static uint32_t audio_window_start_ms = millis();
 
   FrameMetrics frame = {};
   uint32_t vu_rectified_ch0_q8 = 0;
@@ -543,15 +601,12 @@ void loop()
 
   noInterrupts();
   uint32_t reading0 = micros();
-  uint32_t frame_work_us = 0;
 
   if (frame_metrics_ready)
   {
     uint8_t ready_index = ready_metrics_index;
     frame.sum_squares_ch0 = metric_buffers[ready_index].sum_squares_ch0;
     frame.sum_squares_ch1 = metric_buffers[ready_index].sum_squares_ch1;
-    frame.sum_squares_sum = metric_buffers[ready_index].sum_squares_sum;
-    frame.sum_squares_diff = metric_buffers[ready_index].sum_squares_diff;
     frame.max_peak_ch0 = metric_buffers[ready_index].max_peak_ch0;
     frame.max_peak_ch1 = metric_buffers[ready_index].max_peak_ch1;
     frame.max_peak_sum = metric_buffers[ready_index].max_peak_sum;
@@ -569,17 +624,11 @@ void loop()
   {
     uint32_t raw_rms_ch0 = integer_sqrt(frame.sum_squares_ch0 / TOTAL_SAMPLES);
     uint32_t raw_rms_ch1 = integer_sqrt(frame.sum_squares_ch1 / TOTAL_SAMPLES);
-    uint32_t raw_rms_sum = integer_sqrt(frame.sum_squares_sum / TOTAL_SAMPLES);
-    uint32_t raw_rms_diff = integer_sqrt(frame.sum_squares_diff / TOTAL_SAMPLES);
 
     if (raw_rms_ch0 <= 2)
       raw_rms_ch0 = 0;
     if (raw_rms_ch1 <= 2)
       raw_rms_ch1 = 0;
-    if (raw_rms_sum <= 2)
-      raw_rms_sum = 0;
-    if (raw_rms_diff <= 2)
-      raw_rms_diff = 0;
 
     uint32_t calibrated_vu_ch0 = (uint32_t)(((uint64_t)vu_rectified_ch0_q8 * VU_RECTIFIED_TO_PEAK_Q12 + (1ULL << 19)) >> 20);
     uint32_t calibrated_vu_ch1 = (uint32_t)(((uint64_t)vu_rectified_ch1_q8 * VU_RECTIFIED_TO_PEAK_Q12 + (1ULL << 19)) >> 20);
@@ -771,17 +820,14 @@ void loop()
       {
         // This is the first serial message after an off period.
         Serial.println("Display on");
-        if (display_mode_selected)
+        if (new_display_mode)
         {
-          if (new_display_mode)
-          {
-            draw_new_layout();
-          }
-          else
-          {
-            draw_block(L_R_HEIGHT, "L", "R");
-            draw_block(S_D_HEIGHT, "S", "D");
-          }
+          draw_new_layout(simple_scale_mode);
+        }
+        else
+        {
+          draw_block(L_R_HEIGHT, "L", "R");
+          draw_block(S_D_HEIGHT, "S", "D");
         }
         digitalWrite(LCD_BACKLIGHT_PIN, HIGH);
         display_is_on = true;
@@ -795,7 +841,7 @@ void loop()
 
     bool should_update_display = !(is_silent_now && last_frame_was_silent);
 
-    if (display_mode_selected && display_is_on && should_update_display)
+    if (display_is_on && should_update_display)
     {
       create_bar(final_vu_db_ch0, pk_db_ch0);
       send_bar(new_display_mode ? 0 : 20,
@@ -812,25 +858,24 @@ void loop()
       }
     }
 
-    last_frame_was_silent = is_silent_now;
+    if (debug_info_mode && should_update_display)
+    {
+      Serial.print(raw_rms_ch0);
+      Serial.print(',');
+      Serial.print(final_vu_db_ch0);
+      Serial.print(',');
+      Serial.print(pk_db_ch0);
+      Serial.print('\t');
+      Serial.print(raw_rms_ch1);
+      Serial.print(',');
+      Serial.print(final_vu_db_ch1);
+      Serial.print(',');
+      Serial.print(pk_db_ch1);
+      Serial.print('\t');
+      Serial.println(frame_work_percent);
+    }
 
-        if (!(is_silent_now && last_frame_was_silent)) {
-            Serial.print(raw_rms_ch0);
-            Serial.print(',');
-            Serial.print(final_vu_db_ch0);
-            Serial.print(',');
-            Serial.print(pk_db_ch0);
-            Serial.print('\t');
-            Serial.print(raw_rms_ch1);
-            Serial.print(',');
-            Serial.print(final_vu_db_ch1);
-            Serial.print(',');
-            Serial.print(pk_db_ch1);
-            Serial.print('\t');
-            Serial.println(frame_work_percent);
-        }
-
-    if (display_mode_selected && display_is_on && should_update_display)
+    if (debug_info_mode && display_is_on && should_update_display)
     {
       draw_audio_metrics(new_display_mode ? 0 : 20,
                          new_display_mode ? NEW_METRICS_Y : 205,
@@ -840,15 +885,16 @@ void loop()
     }
 
     // compute cpu usage once per second
-    if (display_is_on && !(is_silent_now && last_frame_was_silent))
+    if (display_is_on && should_update_display)
     {      
       static uint32_t last_report = 0;
       uint32_t now = millis();
       if (now - last_report >= 1000)
       {
         last_report = now;
-        uint32_t average_frame_work_us = frame_work_total_us / 25;
-        frame_work_percent = (average_frame_work_us * 100UL) / 40000UL;
+        uint32_t average_frame_work_us = frame_work_total_us / AUDIO_FRAMES_PER_SECOND;
+        frame_work_percent =
+            (average_frame_work_us * 100UL) / (1000000UL / AUDIO_FRAMES_PER_SECOND);
         // Serial.print(average_frame_work_us);
         // Serial.print('\t');
         // Serial.print(frame_work_percent);
@@ -856,8 +902,9 @@ void loop()
         frame_work_total_us = 0;
       }
     // account for all loop, will show up next loop run
-    frame_work_us = micros() - reading0;
     frame_work_total_us += micros() - reading0;  
     }
+
+    last_frame_was_silent = is_silent_now;
   }
 }
